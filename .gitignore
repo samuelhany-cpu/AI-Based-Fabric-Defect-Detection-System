@@ -22,7 +22,7 @@ outputs/logs/*
 !outputs/metrics/.gitkeep
 !outputs/figures/.gitkeep
 !outputs/logs/.gitkeep
-
+    
 .DS_Store
 Thumbs.db
 
