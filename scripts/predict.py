@@ -13,10 +13,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.inference.predict import load_checkpoint, predict_image
 from src.utils.config import load_config
+from src.utils.runtime import configure_runtime_environment
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run single-image inference.")
+    parser = argparse.ArgumentParser(description="Run single-image anomaly inference.")
     parser.add_argument("--config", default="src/config/config.yaml", help="Path to config YAML.")
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint.")
     parser.add_argument("--image", required=True, help="Path to image file.")
@@ -26,13 +27,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    configure_runtime_environment(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, checkpoint = load_checkpoint(args.checkpoint, device=device)
+    model_bundle, checkpoint = load_checkpoint(args.checkpoint, device=device)
     prediction = predict_image(
         image_path=args.image,
-        model=model,
+        model=model_bundle,
         config=config,
-        device=device,
         threshold=checkpoint.get("threshold"),
     )
     print(json.dumps(prediction, indent=2))

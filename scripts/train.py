@@ -5,10 +5,7 @@ import json
 from pathlib import Path
 import sys
 
-import pandas as pd
 import torch
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,27 +13,39 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import FabricDefectDataset
-from src.data.transforms import build_eval_transform, build_train_transform
-from src.models.factory import create_model
-from src.training.engine import evaluate, train_one_epoch
-from src.training.loss import build_criterion, compute_pos_weight
-from src.training.metrics import save_history_figure
+from src.data.transforms import build_eval_transform
+from src.models.anomaly import (
+    build_memory_bank,
+    create_patch_extractor,
+    extract_patch_embeddings,
+    fit_patch_neighbors,
+    score_patch_embeddings,
+)
+from src.training.metrics import (
+    build_portfolio_summary,
+    compute_best_f1_threshold,
+    compute_classification_metrics,
+    save_metrics,
+)
 from src.utils.config import load_config
 from src.utils.logger import setup_logger
+from src.utils.runtime import configure_runtime_environment, describe_torch_runtime
 from src.utils.seed import seed_everything
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the Phase 1 baseline model.")
+    parser = argparse.ArgumentParser(
+        description="Fit the patch-level anomaly detector from experiment 3."
+    )
     parser.add_argument("--config", default="src/config/config.yaml", help="Path to config YAML.")
     return parser.parse_args()
 
 
-def build_dataloader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
+def build_dataloader(dataset, batch_size: int, num_workers: int) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
@@ -45,12 +54,13 @@ def build_dataloader(dataset, batch_size: int, num_workers: int, shuffle: bool) 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    runtime_info = configure_runtime_environment(config)
     seed_everything(config["project"]["seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    paths_cfg = config["paths"]
-    logs_dir = Path(paths_cfg["logs_dir"])
-    logger = setup_logger("train", logs_dir / "train.log")
+    logger = setup_logger("train", Path(config["paths"]["logs_dir"]) / "train.log")
+    logger.info("Runtime directories: %s", runtime_info)
+    logger.info("Torch runtime: %s", describe_torch_runtime(torch))
 
     manifest_path = Path(config["dataset"]["manifest_path"])
     if not manifest_path.exists():
@@ -58,121 +68,152 @@ def main() -> None:
             f"Manifest not found at {manifest_path}. Run scripts/create_splits.py first."
         )
 
+    transform = build_eval_transform(config)
+    training_cfg = config["training"]
+    batch_size = int(training_cfg["batch_size"])
+    num_workers = int(config["dataset"]["num_workers"])
+
     train_dataset = FabricDefectDataset(
         manifest_path=manifest_path,
         split="train",
-        transform=build_train_transform(config),
+        transform=transform,
+        allowed_labels={0},
     )
     val_dataset = FabricDefectDataset(
         manifest_path=manifest_path,
         split="val",
-        transform=build_eval_transform(config),
+        transform=transform,
     )
 
-    batch_size = config["training"]["batch_size"]
-    num_workers = config["dataset"]["num_workers"]
-    train_loader = build_dataloader(train_dataset, batch_size, num_workers, shuffle=True)
-    val_loader = build_dataloader(val_dataset, batch_size, num_workers, shuffle=False)
+    train_loader = build_dataloader(train_dataset, batch_size=batch_size, num_workers=num_workers)
+    val_loader = build_dataloader(val_dataset, batch_size=batch_size, num_workers=num_workers)
 
-    training_cfg = config["training"]
-    model = create_model(
+    extractor = create_patch_extractor(
         model_name=training_cfg["model_name"],
         pretrained=training_cfg["pretrained"],
-        freeze_backbone=training_cfg["freeze_backbone"],
     ).to(device)
+    extractor.eval()
 
-    train_manifest = pd.read_csv(manifest_path)
-    train_labels = train_manifest[train_manifest["split"] == "train"]["label"].astype(int).tolist()
-    criterion = build_criterion(device=device, pos_weight=compute_pos_weight(train_labels))
-    optimizer = AdamW(
-        params=[parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=training_cfg["learning_rate"],
-        weight_decay=training_cfg["weight_decay"],
+    logger.info("Extracting train patch embeddings from non-defective images only.")
+    train_embeddings = extract_patch_embeddings(
+        dataloader=train_loader,
+        model=extractor,
+        device=device,
+        amp_enabled=training_cfg["amp"],
     )
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=training_cfg["scheduler_factor"],
-        patience=training_cfg["scheduler_patience"],
+    logger.info("Train normal images: %s", len(train_embeddings.patch_lists))
+
+    memory_bank = build_memory_bank(
+        patch_lists=train_embeddings.patch_lists,
+        max_patches=training_cfg["max_patches"],
+        random_seed=config["project"]["seed"],
+    )
+    neighbors = fit_patch_neighbors(
+        memory_bank=memory_bank,
+        n_neighbors=training_cfg["patch_knn_neighbors"],
     )
 
-    model_dir = Path(paths_cfg["model_dir"])
-    figures_dir = Path(paths_cfg["figures_dir"])
+    logger.info("Extracting validation patch embeddings for threshold calibration.")
+    val_embeddings = extract_patch_embeddings(
+        dataloader=val_loader,
+        model=extractor,
+        device=device,
+        amp_enabled=training_cfg["amp"],
+    )
+    val_scores, _ = score_patch_embeddings(
+        patch_lists=val_embeddings.patch_lists,
+        neighbors=neighbors,
+        top_k=training_cfg["patch_top_k"],
+    )
+    val_labels = val_embeddings.labels.tolist()
+
+    threshold_strategy = training_cfg.get("threshold_strategy", "best_f1")
+    if threshold_strategy == "best_f1":
+        threshold, best_f1 = compute_best_f1_threshold(val_labels, val_scores.tolist())
+    elif threshold_strategy == "normal_quantile":
+        normal_scores = val_scores[val_embeddings.labels == 0]
+        threshold = float(torch.quantile(torch.tensor(normal_scores), training_cfg["threshold_quantile"]).item())
+        best_f1 = compute_classification_metrics(
+            y_true=val_labels,
+            y_prob=val_scores.tolist(),
+            threshold=threshold,
+        )["f1"]
+    else:
+        raise ValueError(f"Unsupported threshold strategy: {threshold_strategy}")
+
+    val_metrics = compute_classification_metrics(
+        y_true=val_labels,
+        y_prob=val_scores.tolist(),
+        threshold=threshold,
+    )
+    val_metrics["image_paths"] = val_embeddings.image_paths
+    val_metrics["y_true"] = val_labels
+    val_metrics["y_prob"] = val_scores.tolist()
+    val_metrics["threshold_strategy"] = threshold_strategy
+    val_metrics["threshold"] = float(threshold)
+    val_metrics["best_f1_at_threshold"] = float(best_f1)
+
+    model_dir = Path(config["paths"]["model_dir"])
+    metrics_dir = Path(config["paths"]["metrics_dir"])
     model_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    best_f1 = float("-inf")
-    patience_counter = 0
-    history = {"train_loss": [], "val_loss": [], "train_f1": [], "val_f1": []}
-    best_checkpoint_path = model_dir / "best_model.pt"
+    checkpoint = {
+        "model_type": "patch_anomaly",
+        "model_name": training_cfg["model_name"],
+        "extractor_state_dict": extractor.state_dict(),
+        "memory_bank": memory_bank.cpu(),
+        "patch_knn_neighbors": int(training_cfg["patch_knn_neighbors"]),
+        "patch_top_k": int(training_cfg["patch_top_k"]),
+        "threshold": float(threshold),
+        "threshold_strategy": threshold_strategy,
+        "feature_map_hw": list(val_embeddings.feature_map_hw),
+        "config": config,
+        "best_val_metrics": {
+            "accuracy": val_metrics["accuracy"],
+            "precision": val_metrics["precision"],
+            "recall": val_metrics["recall"],
+            "f1": val_metrics["f1"],
+            "roc_auc": val_metrics["roc_auc"],
+            "confusion_matrix": val_metrics["confusion_matrix"],
+        },
+    }
 
-    for epoch in range(1, training_cfg["epochs"] + 1):
-        train_metrics = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            amp_enabled=training_cfg["amp"],
-            threshold=training_cfg["decision_threshold"],
-        )
-        val_metrics = evaluate(
-            model=model,
-            dataloader=val_loader,
-            criterion=criterion,
-            device=device,
-            amp_enabled=training_cfg["amp"],
-            threshold=training_cfg["decision_threshold"],
-        )
+    checkpoint_path = model_dir / "best_model.pt"
+    torch.save(checkpoint, checkpoint_path)
+    save_metrics(val_metrics, metrics_dir / "val_metrics.json")
+    save_metrics(
+        build_portfolio_summary(
+            experiment_name="Patch-level ResNet18 + kNN",
+            metrics=val_metrics,
+            threshold=float(threshold),
+            threshold_strategy=threshold_strategy,
+        ),
+        metrics_dir / "val_portfolio_summary.json",
+    )
 
-        scheduler.step(val_metrics["f1"])
+    summary = {
+        "train_normal_images": len(train_embeddings.patch_lists),
+        "memory_bank_size": int(memory_bank.shape[0]),
+        "embedding_dim": int(memory_bank.shape[1]),
+        "feature_map_hw": list(val_embeddings.feature_map_hw),
+        "threshold": float(threshold),
+        "threshold_strategy": threshold_strategy,
+        "best_val_f1": float(best_f1),
+        "checkpoint": str(checkpoint_path.resolve()),
+    }
+    with (model_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
-        history["train_loss"].append(train_metrics["loss"])
-        history["val_loss"].append(val_metrics["loss"])
-        history["train_f1"].append(train_metrics["f1"])
-        history["val_f1"].append(val_metrics["f1"])
-
-        logger.info(
-            "Epoch %s | train_loss=%.4f train_f1=%.4f | val_loss=%.4f val_f1=%.4f",
-            epoch,
-            train_metrics["loss"],
-            train_metrics["f1"],
-            val_metrics["loss"],
-            val_metrics["f1"],
-        )
-
-        if val_metrics["f1"] > best_f1:
-            best_f1 = val_metrics["f1"]
-            patience_counter = 0
-            checkpoint = {
-                "model_state_dict": model.state_dict(),
-                "model_name": training_cfg["model_name"],
-                "threshold": training_cfg["decision_threshold"],
-                "config": config,
-                "best_val_metrics": {
-                    "loss": val_metrics["loss"],
-                    "accuracy": val_metrics["accuracy"],
-                    "precision": val_metrics["precision"],
-                    "recall": val_metrics["recall"],
-                    "f1": val_metrics["f1"],
-                    "roc_auc": val_metrics["roc_auc"],
-                    "confusion_matrix": val_metrics["confusion_matrix"],
-                },
-            }
-            torch.save(checkpoint, best_checkpoint_path)
-            logger.info("Saved new best checkpoint to %s", best_checkpoint_path)
-        else:
-            patience_counter += 1
-            if patience_counter >= training_cfg["early_stopping_patience"]:
-                logger.info("Early stopping triggered at epoch %s", epoch)
-                break
-
-    history_path = model_dir / "training_history.json"
-    with history_path.open("w", encoding="utf-8") as handle:
-        json.dump(history, handle, indent=2)
-
-    save_history_figure(history, figures_dir / "training_curves.png")
-    logger.info("Training finished. Best validation F1 = %.4f", best_f1)
+    logger.info("Saved anomaly checkpoint to %s", checkpoint_path)
+    logger.info(
+        "Validation metrics | accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f roc_auc=%s",
+        val_metrics["accuracy"],
+        val_metrics["precision"],
+        val_metrics["recall"],
+        val_metrics["f1"],
+        f"{val_metrics['roc_auc']:.4f}" if val_metrics["roc_auc"] is not None else "n/a",
+    )
 
 
 if __name__ == "__main__":

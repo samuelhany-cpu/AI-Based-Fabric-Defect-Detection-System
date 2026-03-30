@@ -28,3 +28,10 @@ Thumbs.db
 
 
 data/
+
+.runtime-cache/
+
+code.txt
+
+.agents/
+.specify/

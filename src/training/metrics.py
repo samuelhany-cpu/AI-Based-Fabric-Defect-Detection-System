@@ -11,6 +11,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -44,6 +45,42 @@ def compute_classification_metrics(
         metrics["roc_auc"] = None
 
     return metrics
+
+
+def compute_best_f1_threshold(y_true: list[int], y_score: list[float]) -> tuple[float, float]:
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    if len(thresholds) == 0:
+        default_threshold = 0.5
+        return default_threshold, f1_score(y_true, [int(score >= default_threshold) for score in y_score], zero_division=0)
+
+    f1_values = 2 * (precision[:-1] * recall[:-1]) / (precision[:-1] + recall[:-1] + 1e-8)
+    best_index = int(np.argmax(f1_values))
+    return float(thresholds[best_index]), float(f1_values[best_index])
+
+
+def build_portfolio_summary(
+    experiment_name: str,
+    metrics: dict[str, object],
+    threshold: float,
+    threshold_strategy: str,
+) -> dict[str, object]:
+    report = metrics["classification_report"]
+    matrix = np.asarray(metrics["confusion_matrix"], dtype=int)
+    return {
+        "experiment": experiment_name,
+        "accuracy": float(metrics["accuracy"]),
+        "precision": float(metrics["precision"]),
+        "recall": float(metrics["recall"]),
+        "f1_normal": float(report["non_defective"]["f1-score"]),
+        "f1_defect": float(report["defective"]["f1-score"]),
+        "roc_auc": None if metrics["roc_auc"] is None else float(metrics["roc_auc"]),
+        "threshold": float(threshold),
+        "threshold_strategy": threshold_strategy,
+        "false_positives": int(matrix[0, 1]),
+        "false_negatives": int(matrix[1, 0]),
+        "support_normal": int(report["non_defective"]["support"]),
+        "support_defect": int(report["defective"]["support"]),
+    }
 
 
 def extract_failure_cases(

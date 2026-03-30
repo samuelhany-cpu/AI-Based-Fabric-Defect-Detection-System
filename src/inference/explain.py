@@ -6,59 +6,8 @@ import matplotlib.cm as cm
 import numpy as np
 import torch
 from PIL import Image
-from torch import nn
 
-from src.data.transforms import IMAGENET_MEAN, IMAGENET_STD, build_eval_transform
-
-
-def find_last_conv_layer(model: nn.Module) -> nn.Module:
-    last_conv = None
-    for module in model.modules():
-        if isinstance(module, nn.Conv2d):
-            last_conv = module
-    if last_conv is None:
-        raise ValueError("Could not find a convolutional layer for Grad-CAM.")
-    return last_conv
-
-
-class GradCAM:
-    def __init__(self, model: nn.Module, target_layer: nn.Module) -> None:
-        self.model = model
-        self.target_layer = target_layer
-        self.activations = None
-        self.gradients = None
-
-        self.forward_handle = target_layer.register_forward_hook(self._save_activation)
-        self.backward_handle = target_layer.register_full_backward_hook(self._save_gradient)
-
-    def _save_activation(self, module, inputs, output) -> None:
-        self.activations = output.detach()
-
-    def _save_gradient(self, module, grad_input, grad_output) -> None:
-        self.gradients = grad_output[0].detach()
-
-    def generate(self, image_tensor: torch.Tensor) -> np.ndarray:
-        self.model.zero_grad(set_to_none=True)
-        logits = self.model(image_tensor).squeeze(1)
-        score = logits[0]
-        score.backward()
-
-        pooled_gradients = self.gradients.mean(dim=(2, 3), keepdim=True)
-        weighted_activations = pooled_gradients * self.activations
-        heatmap = weighted_activations.sum(dim=1).squeeze()
-        heatmap = torch.relu(heatmap)
-        heatmap /= heatmap.max().clamp(min=1e-8)
-        return heatmap.cpu().numpy()
-
-    def close(self) -> None:
-        self.forward_handle.remove()
-        self.backward_handle.remove()
-
-
-def denormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
-    image = image_tensor.detach().cpu().numpy().transpose(1, 2, 0)
-    image = (image * np.array(IMAGENET_STD)) + np.array(IMAGENET_MEAN)
-    return np.clip(image, 0.0, 1.0)
+from src.inference.predict import score_image
 
 
 def overlay_heatmap_on_image(
@@ -72,30 +21,28 @@ def overlay_heatmap_on_image(
     return Image.fromarray((overlay * 255).astype(np.uint8))
 
 
-def generate_gradcam_visualization(
+def generate_patch_anomaly_visualization(
     image_path: str | Path,
-    model: nn.Module,
+    model_bundle: dict[str, object],
     config: dict,
-    device: torch.device,
     output_path: str | Path,
 ) -> Path:
-    transform = build_eval_transform(config)
     image = Image.open(image_path).convert("RGB")
-    image_tensor = transform(image).unsqueeze(0).to(device)
-
-    gradcam = GradCAM(model=model, target_layer=find_last_conv_layer(model))
-    try:
-        heatmap = gradcam.generate(image_tensor)
-    finally:
-        gradcam.close()
-
-    heatmap_image = Image.fromarray((heatmap * 255).astype(np.uint8)).resize(
-        image.size, Image.BILINEAR
+    _, patch_score_map, feature_map_hw = score_image(
+        image_path=image_path,
+        model_bundle=model_bundle,
+        config=config,
     )
-    heatmap_array = np.asarray(heatmap_image, dtype=np.float32) / 255.0
-    base_image = denormalize_image(image_tensor.squeeze(0))
-    base_image = np.asarray(Image.fromarray((base_image * 255).astype(np.uint8)).resize(image.size))
-    base_image = base_image.astype(np.float32) / 255.0
+    heatmap = np.asarray(patch_score_map, dtype=np.float32).reshape(feature_map_hw)
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    heatmap_tensor = torch.tensor(heatmap).unsqueeze(0).unsqueeze(0).float()
+    heatmap_array = torch.nn.functional.interpolate(
+        heatmap_tensor,
+        size=(image.height, image.width),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze().cpu().numpy()
+    base_image = np.asarray(image, dtype=np.float32) / 255.0
     overlay = overlay_heatmap_on_image(base_image, heatmap_array)
 
     destination = Path(output_path)
